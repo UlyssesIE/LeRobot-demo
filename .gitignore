@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 训练产物
+outputs/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# 日志与 W&B
+.wandb/
+wandb/
+*.log
+
+# 数据（本地下载的数据集不入库）
+data/
+datasets/
+
+# 密钥
+.env
+*.token
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+ 
+
+# 工具缓存
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
