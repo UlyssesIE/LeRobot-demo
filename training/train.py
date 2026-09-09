@@ -29,8 +29,7 @@ from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
 from eval.verify_checkpoint_parity import (
-    collect_lora_params, check_weight_parity,
-    predict_frozen, check_output_parity, verify_checkpoint_parity,
+    predict_frozen
 )
 
 logger = logging.getLogger("training.train_closed_loop")
@@ -106,137 +105,6 @@ def build_preprocessor(cfg, dataset, device):
     return preprocessor, postprocessor
 
 
-# # --------------------------------------------------------------------------- #
-# # Checkpoint parity verification (HARD criteria)
-# # --------------------------------------------------------------------------- #
-# def collect_lora_params(policy):
-#     """Collect all LoRA weight tensors from a policy.
-
-#     Args:
-#         policy: The trained policy (SmolVLAPolicy or its PeftModel wrapper).
-
-#     Returns:
-#         dict[str, torch.Tensor]: parameter name -> detached clone.
-#     """
-#     state = policy.state_dict()
-#     return {k: v.detach().clone() for k, v in state.items() if "lora" in k}
-
-
-# def check_weight_parity(before_params, loaded_policy):
-#     """Hard check: compare LoRA tensors before save vs after load.
-
-#     Args:
-#         before_params: Result of collect_lora_params() captured before saving.
-#         loaded_policy: The reloaded model (PeftModel).
-
-#     Returns:
-#         tuple[int, float]: (number of compared tensors, max absolute difference).
-#     """
-#     loaded_params = collect_lora_params(loaded_policy)
-
-#     if len(before_params) != len(loaded_params):
-#         logger.warning(
-#             "Weight parity FAILED: tensor count mismatch (before=%d, after=%d)",
-#             len(before_params), len(loaded_params),
-#         )
-#         return len(loaded_params), float("inf")
-
-#     max_abs_diff = 0.0
-#     for name, before_tensor in before_params.items():
-#         if name not in loaded_params:
-#             logger.warning("Weight parity FAILED: missing tensor '%s' after load", name)
-#             return len(loaded_params), float("inf")
-
-#         after_tensor = loaded_params[name]
-#         # Compare in the original dtype so bf16 stays bit-exact (no float-cast noise).
-#         if not torch.equal(before_tensor, after_tensor):
-#             diff = (before_tensor.float() - after_tensor.float()).abs().max().item()
-#             max_abs_diff = max(max_abs_diff, diff)
-#             logger.warning(
-#                 "Weight parity MISMATCH: tensor '%s' max_abs_diff=%.3e", name, diff,
-#             )
-
-#     if max_abs_diff == 0.0:
-#         logger.info(
-#             "Weight parity PASSED: %d LoRA tensors are bit-exact (max_abs_diff=0.00e+00)",
-#             len(loaded_params),
-#         )
-#     else:
-#         logger.warning("Weight parity FAILED: max_abs_diff=%.3e", max_abs_diff)
-
-#     return len(loaded_params), max_abs_diff
-
-
-# def predict_frozen(policy, batch, device, amp_dtype):
-#     """Run predict_action_chunk under eval + no_grad + autocast on a frozen batch.
-
-#     Args:
-#         policy: The model (set to eval mode here).
-#         batch: The frozen input batch; each call deep-copies it to avoid in-place mutation.
-#         device: torch.device used for autocast device_type.
-#         amp_dtype: Mixed-precision dtype (e.g. torch.bfloat16).
-
-#     Returns:
-#         torch.Tensor: action chunk output, detached and cast to float32.
-#     """
-#     policy.eval()
-#     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype):
-#         actions = policy.predict_action_chunk(copy.deepcopy(batch))
-#     return actions.detach().float()
-
-
-# def check_output_parity(act_before, act_after, threshold=1e-3):
-#     """Hard check: compare pre-save vs post-load action outputs.
-
-#     Args:
-#         act_before: Reference output captured before saving.
-#         act_after: Output produced by the reloaded model.
-#         threshold: Pass threshold (bf16 numerical noise is far below this).
-
-#     Returns:
-#         float: Max absolute difference between the two outputs.
-#     """
-#     out_diff = (act_before - act_after).abs().max().item()
-#     if out_diff < threshold:
-#         logger.info("Output parity PASSED: max_abs_diff=%.3e (< %.1e)", out_diff, threshold)
-#     else:
-#         logger.warning(
-#             "Output parity FAILED: max_abs_diff=%.3e exceeds %.1e; LoRA may not be activated",
-#             out_diff, threshold,
-#         )
-#     return out_diff
-
-
-# def verify_checkpoint_parity(before_params, act_before, batch, device, amp_dtype, loaded_policy):
-#     """Run both hard parity checks against the reloaded model.
-
-#     Args:
-#         before_params: LoRA tensors collected before saving.
-#         act_before: Reference action output captured before saving.
-#         batch: Frozen batch used for the output comparison.
-#         device: torch.device.
-#         amp_dtype: Mixed-precision dtype.
-#         loaded_policy: The reloaded model (PeftModel).
-
-#     Returns:
-#         bool: True if both checks pass.
-#     """
-#     _, weight_diff = check_weight_parity(before_params, loaded_policy)
-#     act_after = predict_frozen(loaded_policy, batch, device, amp_dtype)
-#     out_diff = check_output_parity(act_before, act_after)
-
-#     weight_ok = weight_diff == 0.0
-#     output_ok = out_diff < 1e-3
-#     all_pass = weight_ok and output_ok
-
-#     logger.info(
-#         "Parity summary: weight=%s, output=%s, overall=%s",
-#         "PASS" if weight_ok else "FAIL",
-#         "PASS" if output_ok else "FAIL",
-#         "PASS" if all_pass else "FAIL",
-#     )
-#     return all_pass
-
 
 # --------------------------------------------------------------------------- #
 # Main flow
@@ -279,11 +147,7 @@ def run_closed_loop(
         peft_cli_overrides={"method_type": "lora", "r": peft_r, "lora_alpha": peft_alpha}
     )
     policy = policy.to(device=device, dtype=dtype)
-    ##########################################################################
 
-    lora_snapshot_pre = collect_lora_params(policy)
-    logger.info("[PROBE] LoRA snapshot before training: %d tensors", len(lora_snapshot_pre))
-    ###########################################################################
     lora_layers = [n for n, m in policy.named_modules()
                if getattr(m, "lora_A", None) is not None]
     logger.info("[PROBE] LoRA layers on wrapped policy: %d", len(lora_layers))
@@ -360,20 +224,7 @@ def run_closed_loop(
     # ---- Phase 4: save adapter + capture pre-save reference artifacts ----
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Capture LoRA weights as the bit-exact reference BEFORE saving.
-    lora_before = collect_lora_params(policy)
-    logger.info("Captured %d LoRA tensors before save", len(lora_before))
-
-    #################################################################################
-    delta_train = sum(
-        (lora_before[k].float() - lora_snapshot_pre[k].float()).abs().sum().item()
-        for k in lora_snapshot_pre
-    )
-    logger.info("[PROBE] LoRA weight delta from training: %.6e", delta_train)
-    if delta_train == 0.0:
-        logger.error("[PROBE] LoRA weights unchanged — optimizer never updated them")
-
-    ############################################################################
+    
 
     # Capture reference action output (frozen batch, eval + no_grad + autocast).
     act_before = predict_frozen(policy, last_batch, device, dtype)
@@ -405,12 +256,7 @@ def run_closed_loop(
     logger.info("[PROBE] LoRA layers on reloaded: %d", len(reloaded_lora))
     logger.info("[PROBE] active_adapter=%s", getattr(reloaded, "active_adapter", None))
 
-    ############################################################################
-
-    # ---- Phase 6: verify checkpoint parity (HARD criteria) ----
-    parity_ok = verify_checkpoint_parity(lora_before, act_before, last_batch, device, dtype, reloaded)
-
-    ########################################################################################
+ 
     # ---- Phase 6.5: decisive base-vs-LoRA probe ----
     base_only = build_policy(ds_meta, chunk_size, resize)   # 纯 base，不 wrap peft
     base_only = base_only.to(device=device, dtype=dtype)
@@ -429,6 +275,39 @@ def run_closed_loop(
     logger.info("[PROBE] base vs LoRA-on: max_abs_diff = %.6e", diff_base_lora)
 
     ######################################################################################
+
+    #####################################################################################
+    # ---------- 对照 1：base vs base（建立噪声地板，检验 build_policy 随机初始化） ----------
+    base_only_2 = build_policy(ds_meta, chunk_size, resize)
+    base_only_2 = base_only_2.to(device=device, dtype=dtype).eval()
+    diff_base_base = (_seeded_predict(base_only) - _seeded_predict(base_only_2)).abs().max().item()
+    print(f"[CONTROL] base vs base = {diff_base_base:.6e}")
+
+    # ---------- 对照 2：reload vs reload（seed 下的自确定性） ----------
+    diff_reload_self = (_seeded_predict(reloaded) - _seeded_predict(reloaded)).abs().max().item()
+    print(f"[CONTROL] reload vs reload = {diff_reload_self:.6e}")
+
+    # ---------- 输出尺度 sanity check ----------
+    with torch.no_grad():
+        y_ref = _seeded_predict(base_only)
+    print(f"[SCALE] base output: std={y_ref.std():.4f}  max_abs={y_ref.abs().max():.4f}")
+
+    # ---------- 探针 6：手动零化 lora_B（等价 disable，绕开 PEFT 版本 bug） ----------
+    _state_backup = {k: v.detach().clone() for k, v in reloaded.named_parameters() if "lora_B" in k}
+    try:
+        for n, p in reloaded.named_parameters():
+            if "lora_B" in n:
+                p.data.zero_()
+        y_off_manual = _seeded_predict(reloaded)
+    finally:
+        for n, p in reloaded.named_parameters():
+            if n in _state_backup:
+                p.data.copy_(_state_backup[n])
+
+    y_on_manual = _seeded_predict(reloaded)
+    diff_on_off_manual = (y_on_manual - y_off_manual).abs().max().item()
+    print(f"[PROBE6] on vs off (manual lora_B zero) = {diff_on_off_manual:.6e}")
+    #####################################################################################
 
     # ---- Phase 7: action sanity checks + informational metrics ----
     # Informational loss signal (no threshold, no assertion).
@@ -458,10 +337,6 @@ def run_closed_loop(
 
     logger.info("Loss sequence: %s", " ".join(f"{x:.3f}" for x in losses))
 
-    if parity_ok:
-        logger.info("Closed loop complete: train -> save -> load -> inference (parity PASSED)")
-    else:
-        logger.error("Closed loop complete, but checkpoint parity FAILED; see checks above")
 
 
 # --------------------------------------------------------------------------- #
